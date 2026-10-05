@@ -155,3 +155,136 @@ func TestSharedStorage_StreamingDecodeFirstAbort(t *testing.T) {
 		})
 	}
 }
+
+// commitRecorder records whether anything was written to the client.
+// httptest.ResponseRecorder.Code defaults to 200 before WriteHeader, so that
+// field cannot show that an abort left the response untouched.
+type commitRecorder struct {
+	*httptest.ResponseRecorder
+	once      sync.Once
+	written   chan struct{}
+	committed bool
+}
+
+func (r *commitRecorder) WriteHeader(code int) {
+	r.committed = true
+	r.ResponseRecorder.WriteHeader(code)
+}
+
+func (r *commitRecorder) Write(b []byte) (int, error) {
+	r.committed = true
+	defer r.once.Do(func() {
+		if r.written != nil {
+			close(r.written)
+		}
+	})
+	return r.ResponseRecorder.Write(b)
+}
+
+func (r *commitRecorder) Flush() {
+	r.committed = true
+	r.ResponseRecorder.Flush()
+}
+
+// TestSharedStorage_StreamingDecodeFirstErrorAbort covers an aborted decode
+// that produced an error status, or no status at all. The abort has to be
+// replayed on the request goroutine, and a missing status must not be flushed
+// as an empty 200.
+func TestSharedStorage_StreamingDecodeFirstErrorAbort(t *testing.T) {
+	const (
+		errEvent  = `data: {"error":{"message":"unavailable"}}` + "\n\n"
+		errEvent2 = `data: {"error":{"message":"still down"}}` + "\n\n"
+	)
+	tests := []struct {
+		name          string
+		decoder       func(relayed <-chan struct{}) http.Handler
+		wantStatus    int
+		wantBody      string
+		wantCommitted bool
+	}{
+		{
+			name: "abort before any status was written",
+			decoder: func(<-chan struct{}) http.Handler {
+				return http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+					panic(http.ErrAbortHandler)
+				})
+			},
+		},
+		{
+			name: "abort after an error status and a partial body",
+			decoder: func(<-chan struct{}) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = io.WriteString(w, errEvent)
+					panic(http.ErrAbortHandler)
+				})
+			},
+			wantStatus:    http.StatusServiceUnavailable,
+			wantBody:      errEvent,
+			wantCommitted: true,
+		},
+		{
+			name: "abort after the error stream reached the client",
+			decoder: func(relayed <-chan struct{}) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = io.WriteString(w, errEvent+errEvent2)
+					select {
+					case <-relayed:
+					case <-time.After(5 * time.Second):
+					}
+					panic(http.ErrAbortHandler)
+				})
+			},
+			wantStatus:    http.StatusServiceUnavailable,
+			wantBody:      errEvent + errEvent2,
+			wantCommitted: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decodeURL, err := url.Parse("http://decoder:8000")
+			require.NoError(t, err)
+			srv := NewProxy(Config{Port: "0", DecoderURL: decodeURL, KVConnector: constants.KVConnectorSharedStorage})
+			srv.logger = log.Log
+			client := &commitRecorder{ResponseRecorder: httptest.NewRecorder(), written: make(chan struct{})}
+			srv.decoderProxy = tt.decoder(client.written)
+
+			body := `{"model":"m","messages":[],"stream":true,"cache_hit_threshold":0.5}`
+			req := httptest.NewRequest(http.MethodPost, reqcommon.PathChatCompletions, strings.NewReader(body))
+			require.PanicsWithValue(t, http.ErrAbortHandler, func() {
+				srv.handleSharedStorage(client, req, "prefill:8000", reqcommon.APITypeChatCompletions)
+			})
+			require.Equal(t, tt.wantCommitted, client.committed)
+			if tt.wantCommitted {
+				require.Equal(t, tt.wantStatus, client.Code)
+				require.Equal(t, tt.wantBody, client.Body.String())
+			}
+		})
+	}
+}
+
+// TestSharedStorage_StreamingDecodeFirstErrorStatus covers a decode-first
+// stream that fails with a real error status and does not abort. The status
+// and body are forwarded and the handler returns.
+func TestSharedStorage_StreamingDecodeFirstErrorStatus(t *testing.T) {
+	const errEvent = `data: {"error":{"message":"unavailable"}}` + "\n\n"
+	decodeURL, err := url.Parse("http://decoder:8000")
+	require.NoError(t, err)
+	srv := NewProxy(Config{Port: "0", DecoderURL: decodeURL, KVConnector: constants.KVConnectorSharedStorage})
+	srv.logger = log.Log
+	srv.decoderProxy = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, errEvent)
+	})
+
+	body := `{"model":"m","messages":[],"stream":true,"cache_hit_threshold":0.5}`
+	req := httptest.NewRequest(http.MethodPost, reqcommon.PathChatCompletions, strings.NewReader(body))
+	client := httptest.NewRecorder()
+	require.NotPanics(t, func() {
+		srv.handleSharedStorage(client, req, "prefill:8000", reqcommon.APITypeChatCompletions)
+	})
+	require.Equal(t, http.StatusServiceUnavailable, client.Code)
+	require.Equal(t, errEvent, client.Body.String())
+}
