@@ -39,6 +39,10 @@ import (
 // assert such a request is refused before it reaches any upstream.
 const statefulResponsesTestBody = `{"model":"m","input":"hi","previous_response_id":"resp-123","conversation":"conv-123","background":true}`
 
+// streamingDecodeFirstBody is a streaming chat-completions request that takes
+// the decode-first path, shared by the tests that cover that path.
+const streamingDecodeFirstBody = `{"model":"m","messages":[],"stream":true,"cache_hit_threshold":0.5}`
+
 // requireStatefulResponsesRejected asserts the handler answered 400 naming the
 // offending field and dispatched nothing upstream. previous_response_id is the
 // first field RejectStatefulResponsesFields checks, so it is the one named for
@@ -145,7 +149,7 @@ func TestSharedStorage_StreamingDecodeFirstAbort(t *testing.T) {
 			client := &signalingRecorder{ResponseRecorder: httptest.NewRecorder(), written: make(chan struct{})}
 			srv.decoderProxy = tt.decoder(client.written)
 
-			body := `{"model":"m","messages":[],"stream":true,"cache_hit_threshold":0.5}`
+			body := streamingDecodeFirstBody
 			req := httptest.NewRequest(http.MethodPost, reqcommon.PathChatCompletions, strings.NewReader(body))
 			require.PanicsWithValue(t, http.ErrAbortHandler, func() {
 				srv.handleSharedStorage(client, req, "prefill:8000", reqcommon.APITypeChatCompletions)
@@ -251,7 +255,7 @@ func TestSharedStorage_StreamingDecodeFirstErrorAbort(t *testing.T) {
 			client := &commitRecorder{ResponseRecorder: httptest.NewRecorder(), written: make(chan struct{})}
 			srv.decoderProxy = tt.decoder(client.written)
 
-			body := `{"model":"m","messages":[],"stream":true,"cache_hit_threshold":0.5}`
+			body := streamingDecodeFirstBody
 			req := httptest.NewRequest(http.MethodPost, reqcommon.PathChatCompletions, strings.NewReader(body))
 			require.PanicsWithValue(t, http.ErrAbortHandler, func() {
 				srv.handleSharedStorage(client, req, "prefill:8000", reqcommon.APITypeChatCompletions)
@@ -279,7 +283,7 @@ func TestSharedStorage_StreamingDecodeFirstErrorStatus(t *testing.T) {
 		_, _ = io.WriteString(w, errEvent)
 	})
 
-	body := `{"model":"m","messages":[],"stream":true,"cache_hit_threshold":0.5}`
+	body := streamingDecodeFirstBody
 	req := httptest.NewRequest(http.MethodPost, reqcommon.PathChatCompletions, strings.NewReader(body))
 	client := httptest.NewRecorder()
 	require.NotPanics(t, func() {
