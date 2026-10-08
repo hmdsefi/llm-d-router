@@ -38,6 +38,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const (
+	partTypeAnthropicImage      = "image"
+	partTypeAnthropicToolResult = "tool_result"
+)
+
 // Multimodal content types that need encoder processing.
 var mmTypes = map[string]bool{
 	reqcommon.PartTypeImageURL:   true,
@@ -132,7 +137,8 @@ func extractMMItems(logger logr.Logger, requestData map[string]any, apiType reqc
 	// messages entry and a Responses input item land here, so the line names
 	// neither field and carries apiType instead.
 	droppedTurns := 0
-	collect := func(parts []any) {
+	var collect func(parts []any)
+	collect = func(parts []any) {
 		for _, part := range parts {
 			partMap, ok := part.(map[string]any)
 			if !ok {
@@ -140,6 +146,27 @@ func extractMMItems(logger logr.Logger, requestData map[string]any, apiType reqc
 			}
 			partType, ok := partMap[reqcommon.FieldType].(string)
 			if !ok {
+				continue
+			}
+
+			// Anthropic image blocks are not a chat part. The encoder is posted
+			// at /v1/chat/completions, which only primes image_url, so reshape
+			// before the part is forwarded as-is. Nested images live in
+			// tool_result.content, which ItemPartArrays does not walk.
+			if apiType == reqcommon.APITypeMessages && partType == partTypeAnthropicToolResult {
+				if nested, ok := partMap["content"].([]any); ok {
+					collect(nested)
+				}
+				continue
+			}
+			if apiType == reqcommon.APITypeMessages && partType == partTypeAnthropicImage {
+				converted, ok := anthropicImagePart(partMap)
+				if !ok {
+					logger.V(logging.DEBUG).Info("skipping anthropic image the encoder cannot be primed with")
+					droppedParts++
+					continue
+				}
+				items = append(items, converted)
 				continue
 			}
 
@@ -201,6 +228,42 @@ func extractMMItems(logger logr.Logger, requestData map[string]any, apiType reqc
 
 // mmItemsForFanout extracts the fanout items for one request, tagging the
 // extraction logs with requestID.
+// anthropicImagePart turns a Messages API image block into the image_url
+// part vLLM's chat-completions encoder parser primes. A url source is copied
+// through. A base64 source becomes a data URL.
+func anthropicImagePart(part map[string]any) (map[string]any, bool) {
+	source, ok := part["source"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	switch source["type"] {
+	case "url":
+		rawURL, _ := source["url"].(string)
+		if rawURL == "" {
+			return nil, false
+		}
+		return map[string]any{
+			"type":      reqcommon.PartTypeImageURL,
+			"image_url": map[string]any{"url": rawURL},
+		}, true
+	case "base64":
+		data, _ := source["data"].(string)
+		if data == "" {
+			return nil, false
+		}
+		mediaType, _ := source["media_type"].(string)
+		if mediaType == "" {
+			mediaType = "application/octet-stream"
+		}
+		return map[string]any{
+			"type":      reqcommon.PartTypeImageURL,
+			"image_url": map[string]any{"url": "data:" + mediaType + ";base64," + data},
+		}, true
+	default:
+		return nil, false
+	}
+}
+
 func (s *Server) mmItemsForFanout(originalRequest map[string]any, requestID string, apiType reqcommon.APIType) []map[string]any {
 	return extractMMItems(s.logger.WithValues("requestID", requestID), originalRequest, apiType)
 }

@@ -400,3 +400,33 @@ func TestHandleEC_EncoderErrorStatus(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractMMItemsConvertsAnthropicImages(t *testing.T) {
+	messages, err := json.Marshal([]any{
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": "look"},
+			map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": "https://example.com/a.png"}},
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.com/b.png"}},
+			map[string]any{"type": "tool_result", "tool_use_id": "toolu_1", "content": []any{
+				map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "aaaa"}},
+			}},
+		}},
+	})
+	require.NoError(t, err)
+
+	items := extractMMItems(log.Log, map[string]any{"messages": json.RawMessage(messages)}, reqcommon.APITypeMessages)
+	require.Len(t, items, 3)
+	assert.Equal(t, reqcommon.PartTypeImageURL, items[0]["type"])
+	assert.Equal(t, map[string]any{"url": "https://example.com/a.png"}, items[0]["image_url"])
+	assert.Equal(t, map[string]any{"url": "https://example.com/b.png"}, items[1]["image_url"])
+	assert.Equal(t, map[string]any{"url": "data:image/png;base64,aaaa"}, items[2]["image_url"])
+
+	// A chat completion does not speak Anthropic image blocks.
+	chat, err := json.Marshal([]any{
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": "https://example.com/a.png"}},
+		}},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, extractMMItems(log.Log, map[string]any{"messages": json.RawMessage(chat)}, reqcommon.APITypeChatCompletions))
+}
