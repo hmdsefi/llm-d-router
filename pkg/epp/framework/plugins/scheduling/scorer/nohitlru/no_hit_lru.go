@@ -252,7 +252,7 @@ func (s *NoHitLRU) scoreNeverUsedPods(scoredPods map[scheduling.Endpoint]float64
 	}
 }
 
-// scoreUsedPods assigns scores to endpoints based on their LRU position.
+// scoreUsedPods assigns scores to endpoints based on their relative LRU order among usedPods.
 // Pods that were least recently used for cold requests receive higher scores.
 func (s *NoHitLRU) scoreUsedPods(scoredEndpoints map[scheduling.Endpoint]float64, usedPods []scheduling.Endpoint, lruPosition map[string]int, neverUsedCount, totalEndpoints int) {
 	// Avoid possibility of dividing by zero.
